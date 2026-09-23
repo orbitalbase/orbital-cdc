@@ -1,4 +1,4 @@
-module github.com/mingerz/cdc102
+module github.com/orbitalbase/orbital-cdc
 
 go 1.25.0
 

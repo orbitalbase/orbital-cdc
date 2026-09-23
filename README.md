@@ -21,10 +21,10 @@ For a publication that covers all tables, use `FOR ALL TABLES` only when that is
 ## 1. Install the generator
 
 ```sh
-go install github.com/mingerz/cdc102/cmd/pgrepl-gen@v0.1.0
+go install github.com/orbitalbase/orbital-cdc/cmd/pgrepl-gen@v0.1.0
 ```
 
-The module path currently uses the local repository identity. If this repository is published under another GitHub owner or name, update `go.mod`, the generated import path, and these install instructions before tagging a release.
+The module path is `github.com/orbitalbase/orbital-cdc`.
 
 ## 2. Initialize configuration and generate types
 
@@ -78,7 +78,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/mingerz/cdc102"
+	"github.com/orbitalbase/orbital-cdc"
 	generated "my-app/internal/cdc"
 )
 
