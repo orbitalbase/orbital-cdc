@@ -1,0 +1,328 @@
+// pgrepl-gen is the schema discovery and Go code generation command for cdc.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"go/format"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"unicode"
+
+	"github.com/jackc/pgx/v5"
+	"gopkg.in/yaml.v3"
+)
+
+type config struct {
+	Version        string        `yaml:"version"`
+	DatabaseURLEnv string        `yaml:"database_url_env"`
+	Publication    string        `yaml:"publication"`
+	Slot           string        `yaml:"slot"`
+	Tables         []tableConfig `yaml:"tables"`
+}
+
+type tableConfig struct {
+	Schema  string `yaml:"schema"`
+	Name    string `yaml:"name"`
+	Enabled bool   `yaml:"enabled"`
+}
+
+type column struct {
+	Name     string
+	DataType string
+	UDTName  string
+	Nullable bool
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	var err error
+	switch os.Args[1] {
+	case "version":
+		fmt.Println("pgrepl-gen v0.1.0")
+	case "init":
+		err = initCommand(os.Args[2:])
+	case "generate":
+		err = generateCommand(os.Args[2:])
+	default:
+		usage()
+		os.Exit(2)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pgrepl-gen:", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage: pgrepl-gen <init|generate|version> [flags]")
+}
+
+func initCommand(args []string) error {
+	flags := flag.NewFlagSet("init", flag.ContinueOnError)
+	dsn := flags.String("dsn", os.Getenv("CDC_DATABASE_URL"), "PostgreSQL connection string (defaults to CDC_DATABASE_URL)")
+	configPath := flags.String("config", "pgrepl.yaml", "configuration file to create")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *dsn == "" {
+		return fmt.Errorf("provide --dsn or set CDC_DATABASE_URL")
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, *dsn)
+	if err != nil {
+		return fmt.Errorf("connect to PostgreSQL: %w", err)
+	}
+	defer conn.Close(ctx)
+	rows, err := conn.Query(ctx, `SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name`)
+	if err != nil {
+		return fmt.Errorf("list tables: %w", err)
+	}
+	var tables []tableConfig
+	for rows.Next() {
+		var table tableConfig
+		if err := rows.Scan(&table.Schema, &table.Name); err != nil {
+			rows.Close()
+			return err
+		}
+		table.Enabled = true
+		tables = append(tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(tables) == 0 {
+		return fmt.Errorf("no user tables found")
+	}
+	cfg := config{Version: "1", DatabaseURLEnv: "CDC_DATABASE_URL", Publication: "app_cdc_pub", Slot: "app_cdc_slot", Tables: tables}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(*configPath); err == nil {
+		return fmt.Errorf("%s already exists; remove it or choose another --config path", *configPath)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.WriteFile(*configPath, data, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("Wrote %s with %d tables. Set enabled: false for tables to ignore.\n", *configPath, len(tables))
+	return nil
+}
+
+func generateCommand(args []string) error {
+	flags := flag.NewFlagSet("generate", flag.ContinueOnError)
+	configPath := flags.String("config", "pgrepl.yaml", "configuration file")
+	outputDir := flags.String("out", "internal/cdc", "generated package directory")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(*configPath)
+	if err != nil {
+		return err
+	}
+	var cfg config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	if cfg.Version != "1" {
+		return fmt.Errorf("unsupported config version %q", cfg.Version)
+	}
+	envName := cfg.DatabaseURLEnv
+	if envName == "" {
+		envName = "CDC_DATABASE_URL"
+	}
+	dsn := os.Getenv(envName)
+	if dsn == "" {
+		return fmt.Errorf("environment variable %s is required", envName)
+	}
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("connect to PostgreSQL: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	var tables []generatedTable
+	for _, table := range cfg.Tables {
+		if !table.Enabled {
+			continue
+		}
+		columns, err := loadColumns(ctx, conn, table)
+		if err != nil {
+			return err
+		}
+		if len(columns) == 0 {
+			return fmt.Errorf("enabled table %s.%s has no columns or does not exist", table.Schema, table.Name)
+		}
+		tables = append(tables, generatedTable{tableConfig: table, Type: exportedName(table.Name), Columns: columns})
+	}
+	if len(tables) == 0 {
+		return fmt.Errorf("configuration has no enabled tables")
+	}
+	if err := uniqueNames(tables); err != nil {
+		return err
+	}
+	sort.Slice(tables, func(i, j int) bool {
+		if tables[i].Schema == tables[j].Schema {
+			return tables[i].Name < tables[j].Name
+		}
+		return tables[i].Schema < tables[j].Schema
+	})
+	source, err := render(tables)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(*outputDir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(*outputDir, "cdc.gen.go")
+	if err := os.WriteFile(path, source, 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("Generated %s for %d tables.\n", path, len(tables))
+	return nil
+}
+
+func loadColumns(ctx context.Context, conn *pgx.Conn, table tableConfig) ([]column, error) {
+	rows, err := conn.Query(ctx, `SELECT column_name, data_type, udt_name, is_nullable = 'YES' FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`, table.Schema, table.Name)
+	if err != nil {
+		return nil, fmt.Errorf("read %s.%s columns: %w", table.Schema, table.Name, err)
+	}
+	defer rows.Close()
+	var result []column
+	for rows.Next() {
+		var c column
+		if err := rows.Scan(&c.Name, &c.DataType, &c.UDTName, &c.Nullable); err != nil {
+			return nil, err
+		}
+		result = append(result, c)
+	}
+	return result, rows.Err()
+}
+
+type generatedTable struct {
+	tableConfig
+	Type    string
+	Columns []column
+}
+
+func uniqueNames(tables []generatedTable) error {
+	seen := map[string]string{}
+	for i := range tables {
+		if len(tables) > 1 {
+			tables[i].Type = exportedName(tables[i].Schema) + tables[i].Type
+		}
+		if prior, ok := seen[tables[i].Type]; ok {
+			return fmt.Errorf("tables %s and %s generate the same Go type name %s", prior, tables[i].Schema+"."+tables[i].Name, tables[i].Type)
+		}
+		seen[tables[i].Type] = tables[i].Schema + "." + tables[i].Name
+		fields := map[string]string{}
+		for _, c := range tables[i].Columns {
+			name := exportedName(c.Name)
+			if prior, ok := fields[name]; ok {
+				return fmt.Errorf("columns %q and %q in %s.%s generate the same Go field %s", prior, c.Name, tables[i].Schema, tables[i].Name, name)
+			}
+			fields[name] = c.Name
+		}
+	}
+	return nil
+}
+
+func goType(c column) string {
+	var result string
+	switch c.DataType {
+	case "smallint":
+		result = "int16"
+	case "integer":
+		result = "int32"
+	case "bigint":
+		result = "int64"
+	case "real":
+		result = "float32"
+	case "double precision":
+		result = "float64"
+	case "boolean":
+		result = "bool"
+	case "text", "character varying", "character", "varchar":
+		result = "string"
+	case "date", "time without time zone", "time with time zone", "timestamp without time zone", "timestamp with time zone":
+		result = "time.Time"
+	case "bytea":
+		result = "[]byte"
+	default:
+		result = "any"
+	}
+	if c.Nullable && result != "any" && result != "[]byte" {
+		return "*" + result
+	}
+	return result
+}
+
+func render(tables []generatedTable) ([]byte, error) {
+	var b strings.Builder
+	b.WriteString("// Code generated by pgrepl-gen. DO NOT EDIT.\npackage cdc\n\n")
+	b.WriteString("import (\n\t\"context\"\n\t\"encoding/json\"\n\t\"fmt\"\n\t\"time\"\n\n\tcorecdc \"github.com/mingerz/cdc102\"\n)\n\nvar _ time.Time\n\n")
+	for _, table := range tables {
+		b.WriteString("// " + table.Type + " is generated from " + table.Schema + "." + table.Name + ".\n")
+		b.WriteString("type " + table.Type + " struct {\n")
+		for _, c := range table.Columns {
+			b.WriteString("\t" + exportedName(c.Name) + " " + goType(c) + " `json:\"" + c.Name + "\"`\n")
+		}
+		b.WriteString("}\n\n")
+	}
+	b.WriteString("// Handler receives typed CDC callbacks for the enabled tables.\ntype Handler interface {\n")
+	for _, table := range tables {
+		name := table.Type
+		b.WriteString("\tOn" + name + "Insert(context.Context, " + name + ") error\n")
+		b.WriteString("\tOn" + name + "Update(context.Context, " + name + ", " + name + ") error\n")
+		b.WriteString("\tOn" + name + "Delete(context.Context, " + name + ") error\n")
+		b.WriteString("\tOn" + name + "Truncate(context.Context) error\n")
+	}
+	b.WriteString("}\n\n// Dispatcher converts generic runtime events into generated typed callbacks.\ntype Dispatcher struct { Handler Handler }\n\nfunc (d Dispatcher) Handle(ctx context.Context, event corecdc.Event) error {\n\tif d.Handler == nil { return fmt.Errorf(\"generated CDC handler is nil\") }\n\tswitch event.Schema + \".\" + event.Table {\n")
+	for _, table := range tables {
+		key := table.Schema + "." + table.Name
+		b.WriteString("\tcase \"" + key + "\":\n\t\tswitch event.Operation {\n")
+		b.WriteString("\t\tcase corecdc.Insert:\n\t\t\trow, err := decode[" + table.Type + "](event.New); if err != nil { return err }; return d.Handler.On" + table.Type + "Insert(ctx, row)\n")
+		b.WriteString("\t\tcase corecdc.Update:\n\t\t\toldRow, err := decode[" + table.Type + "](event.Old); if err != nil { return err }; newRow, err := decode[" + table.Type + "](event.New); if err != nil { return err }; return d.Handler.On" + table.Type + "Update(ctx, oldRow, newRow)\n")
+		b.WriteString("\t\tcase corecdc.Delete:\n\t\t\trow, err := decode[" + table.Type + "](event.Old); if err != nil { return err }; return d.Handler.On" + table.Type + "Delete(ctx, row)\n")
+		b.WriteString("\t\tcase corecdc.Truncate:\n\t\t\treturn d.Handler.On" + table.Type + "Truncate(ctx)\n")
+		b.WriteString("\t\tdefault: return fmt.Errorf(\"no generated callback for operation %q on " + key + "\", event.Operation)\n\t\t}\n")
+	}
+	b.WriteString("\tdefault: return fmt.Errorf(\"no generated callback for table %s.%s\", event.Schema, event.Table)\n\t}\n}\n\n")
+	b.WriteString("func decode[T any](row corecdc.Row) (T, error) {\n\tvar result T\n\tcopy := make(corecdc.Row, len(row))\n\tfor key, value := range row { if _, unchanged := value.(corecdc.UnchangedToast); !unchanged { copy[key] = value } }\n\tdata, err := json.Marshal(copy); if err != nil { return result, fmt.Errorf(\"encode CDC row: %w\", err) }\n\tif err := json.Unmarshal(data, &result); err != nil { return result, fmt.Errorf(\"decode typed CDC row: %w\", err) }\n\treturn result, nil\n}\n")
+	formatted, err := format.Source([]byte(b.String()))
+	if err != nil {
+		return nil, fmt.Errorf("format generated Go source: %w\n%s", err, b.String())
+	}
+	return formatted, nil
+}
+
+func exportedName(value string) string {
+	parts := strings.FieldsFunc(value, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	var b strings.Builder
+	for _, part := range parts {
+		runes := []rune(part)
+		if len(runes) > 0 {
+			runes[0] = unicode.ToUpper(runes[0])
+			b.WriteString(string(runes))
+		}
+	}
+	if b.Len() == 0 {
+		return "Column"
+	}
+	name := b.String()
+	if unicode.IsDigit([]rune(name)[0]) {
+		name = "Field" + name
+	}
+	return name
+}
