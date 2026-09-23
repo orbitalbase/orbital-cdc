@@ -277,7 +277,7 @@ func goType(c column) string {
 		result = "bool"
 	case "text", "character varying", "character", "varchar":
 		result = "string"
-	case "date", "time without time zone", "time with time zone", "timestamp without time zone", "timestamp with time zone":
+	case "date", "timestamp without time zone", "timestamp with time zone":
 		result = "time.Time"
 	case "bytea":
 		result = "[]byte"
@@ -320,11 +320,11 @@ func render(tables []generatedTable, cfg config) ([]byte, error) {
 		b.WriteString("\tOn" + name + "Delete(context.Context, " + name + ") error\n")
 		b.WriteString("\tOn" + name + "Truncate(context.Context) error\n")
 	}
-	b.WriteString("}\n\n// Dispatcher converts generic runtime events into generated typed callbacks.\ntype Dispatcher struct { Handler Handler }\n\nfunc (d Dispatcher) Handle(ctx context.Context, event corecdc.Event) error {\n\tif d.Handler == nil { return fmt.Errorf(\"generated CDC handler is nil\") }\n\tswitch event.Schema + \".\" + event.Table {\n")
+	b.WriteString("}\n\n// Dispatcher converts generic runtime events into generated typed callbacks.\ntype Dispatcher struct { Handler Handler }\n\nfunc (d Dispatcher) Handle(ctx context.Context, event corecdc.Event) error {\n\tif d.Handler == nil { return fmt.Errorf(\"generated CDC handler is nil\") }\n\tswitch {\n")
 	for _, table := range tables {
 		key := table.Schema + "." + table.Name
 		callback := strings.TrimSuffix(table.Type, "Row")
-		b.WriteString("\tcase " + strconv.Quote(key) + ":\n\t\tswitch event.Operation {\n")
+		b.WriteString("\tcase event.Schema == " + strconv.Quote(table.Schema) + " && event.Table == " + strconv.Quote(table.Name) + ":\n\t\tswitch event.Operation {\n")
 		b.WriteString("\t\tcase corecdc.Insert:\n\t\t\trow, err := decode" + table.Type + "(event.New); if err != nil { return err }; return d.Handler.On" + callback + "Insert(ctx, row)\n")
 		b.WriteString("\t\tcase corecdc.Update:\n\t\t\toldRow, err := decode" + table.Type + "(event.Old); if err != nil { return err }; newRow, err := decode" + table.Type + "(event.New); if err != nil { return err }; return d.Handler.On" + callback + "Update(ctx, oldRow, newRow)\n")
 		b.WriteString("\t\tcase corecdc.Delete:\n\t\t\trow, err := decode" + table.Type + "(event.Old); if err != nil { return err }; return d.Handler.On" + callback + "Delete(ctx, row)\n")

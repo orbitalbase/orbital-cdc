@@ -62,7 +62,7 @@ pgrepl-gen generate
 
 This writes `internal/cdc/cdc.gen.go`. Commit both `pgrepl.yaml` and the generated file so schema changes are visible in review. Run `pgrepl-gen generate` after changing the database schema or enabled table list.
 
-Common PostgreSQL types such as integer, bigint, text, boolean, timestamps, and bytea receive Go types directly. Other types are emitted as `any`; the generated code does not guess a potentially lossy Go representation. Nullable supported fields are pointers. Generated rows include `CDCFieldsPresent`, a map that distinguishes an omitted replica identity field from a SQL `NULL` value. At runtime, known PostgreSQL OIDs are decoded through pgx's `pgtype` codecs.
+Common PostgreSQL types such as integer, bigint, text, boolean, date/timestamp, and bytea receive Go types directly. Other types, including PostgreSQL `time`, are emitted as `any`; the generated code does not guess a potentially lossy Go representation. Nullable supported fields are pointers. Generated rows include `CDCFieldsPresent`, a map that distinguishes an omitted replica identity field from a SQL `NULL` value. At runtime, known PostgreSQL OIDs are decoded through pgx's `pgtype` codecs.
 
 ## 3. Handle typed events in your application
 
