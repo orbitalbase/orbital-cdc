@@ -138,11 +138,7 @@ func run(ctx context.Context, cfg Config, handler Handler) error {
 		}
 	}
 
-	identity, err := pglogrepl.IdentifySystem(ctx, replConn)
-	if err != nil {
-		return fmt.Errorf("cdc: identify PostgreSQL system: %w", err)
-	}
-	pub := strings.ReplaceAll(strings.ReplaceAll(cfg.Publication, `\`, `\\`), `'`, `\'`)
+	pub := strings.ReplaceAll(cfg.Publication, `'`, `''`)
 	if err := pglogrepl.StartReplication(ctx, replConn, cfg.Slot, startLSN, pglogrepl.StartReplicationOptions{
 		Mode:       pglogrepl.LogicalReplication,
 		PluginArgs: []string{"proto_version '1'", "publication_names '" + pub + "'"},
@@ -150,7 +146,7 @@ func run(ctx context.Context, cfg Config, handler Handler) error {
 		return fmt.Errorf("cdc: start replication: %w", err)
 	}
 
-	return consume(ctx, replConn, identity.XLogPos, startLSN, cfg.HeartbeatInterval, handler)
+	return consume(ctx, replConn, startLSN, cfg.HeartbeatInterval, handler)
 }
 
 type transaction struct {
@@ -158,7 +154,7 @@ type transaction struct {
 	events []Event
 }
 
-func consume(ctx context.Context, conn *pgconn.PgConn, received, acknowledged pglogrepl.LSN, heartbeat time.Duration, handler Handler) error {
+func consume(ctx context.Context, conn *pgconn.PgConn, acknowledged pglogrepl.LSN, heartbeat time.Duration, handler Handler) error {
 	relations := make(map[uint32]*pglogrepl.RelationMessage)
 	typeMap := pgtype.NewMap()
 	var tx *transaction
@@ -214,10 +210,7 @@ func consume(ctx context.Context, conn *pgconn.PgConn, received, acknowledged pg
 						return sendErr
 					}
 				}
-				if data.WALStart > received {
-					received = data.WALStart
-				}
-				_ = received // received is intentionally never acknowledged before commit delivery.
+				// Only a committed transaction that passed every callback advances the acknowledgement LSN.
 			}
 		}
 	}
