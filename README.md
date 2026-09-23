@@ -46,7 +46,7 @@ Edit `enabled` flags as needed, then generate directly from the config:
 pgrepl-gen generate --config examples/pgrepl.yaml
 ```
 
-No environment variable is needed for generation. `generate` uses `database_url` from YAML to inspect current column metadata. It writes `internal/cdc/cdc.gen.go`; commit generated code and the sanitized example, not the local config containing credentials. Run `pgrepl-gen generate` again after column changes. To refresh the discovered table list while keeping your enabled/disabled choices, run `pgrepl-gen init --refresh --config examples/pgrepl.yaml --dsn "postgresql://postgres:YOUR_PASSWORD@localhost:5432/airagv2"`.
+No environment variable is needed for generation. `generate` uses `database_url` from YAML to inspect current column metadata. It writes `internal/cdc/cdc.gen.go`; commit generated code and the sanitized example, not the local config containing credentials. Run `pgrepl-gen generate` again after column changes. To refresh the discovered table list while keeping your enabled/disabled choices, run `pgrepl-gen init --refresh --config examples/pgrepl.yaml`; it reuses the URL already in that file.
 
 The generated application still needs a runtime database connection. Supply that through your deployment's secret manager or environment, as shown below; this is separate from code generation.
 
