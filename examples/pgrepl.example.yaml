@@ -1,0 +1,32 @@
+version: "1"
+database_url: "postgresql://postgres:YOUR_PASSWORD@localhost:5432/airagv2"
+publication: app_cdc_pub
+slot: app_cdc_slot
+tables:
+  - schema: public
+    name: api_keys
+    enabled: true
+  - schema: public
+    name: audit_logs
+    enabled: true
+  - schema: public
+    name: chunk_versions
+    enabled: true
+  - schema: public
+    name: chunks
+    enabled: true
+  - schema: public
+    name: documents
+    enabled: true
+  - schema: public
+    name: goose_db_version
+    enabled: true
+  - schema: public
+    name: jobs
+    enabled: true
+  - schema: public
+    name: organizations
+    enabled: true
+  - schema: public
+    name: users
+    enabled: true

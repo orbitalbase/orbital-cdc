@@ -20,6 +20,7 @@ import (
 
 type config struct {
 	Version        string        `yaml:"version"`
+	DatabaseURL    string        `yaml:"database_url,omitempty"`
 	DatabaseURLEnv string        `yaml:"database_url_env"`
 	Publication    string        `yaml:"publication"`
 	Slot           string        `yaml:"slot"`
@@ -62,7 +63,7 @@ func main() {
 	}
 }
 
-const version = "v0.1.0"
+const version = "v0.1.1"
 
 func currentVersion() string {
 	info, ok := debug.ReadBuildInfo()
@@ -80,11 +81,34 @@ func initCommand(args []string) error {
 	flags := flag.NewFlagSet("init", flag.ContinueOnError)
 	dsn := flags.String("dsn", os.Getenv("CDC_DATABASE_URL"), "PostgreSQL connection string (defaults to CDC_DATABASE_URL)")
 	configPath := flags.String("config", "pgrepl.yaml", "configuration file to create")
+	refresh := flags.Bool("refresh", false, "refresh an existing table list while preserving enabled flags")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	var previous *config
+	if *refresh {
+		if data, err := os.ReadFile(*configPath); err == nil {
+			var old config
+			if err := yaml.Unmarshal(data, &old); err != nil {
+				return fmt.Errorf("read existing config: %w", err)
+			}
+			previous = &old
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if *dsn == "" && previous != nil {
+		*dsn = previous.DatabaseURL
+		if *dsn == "" {
+			envName := previous.DatabaseURLEnv
+			if envName == "" {
+				envName = "CDC_DATABASE_URL"
+			}
+			*dsn = os.Getenv(envName)
+		}
+	}
 	if *dsn == "" {
-		return fmt.Errorf("provide --dsn or set CDC_DATABASE_URL")
+		return fmt.Errorf("provide --dsn, set CDC_DATABASE_URL, or refresh a config containing database_url")
 	}
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, *dsn)
@@ -97,6 +121,12 @@ func initCommand(args []string) error {
 		return fmt.Errorf("list tables: %w", err)
 	}
 	var tables []tableConfig
+	enabled := map[string]bool{}
+	if previous != nil {
+		for _, table := range previous.Tables {
+			enabled[table.Schema+"\x00"+table.Name] = table.Enabled
+		}
+	}
 	for rows.Next() {
 		var table tableConfig
 		if err := rows.Scan(&table.Schema, &table.Name); err != nil {
@@ -104,6 +134,9 @@ func initCommand(args []string) error {
 			return err
 		}
 		table.Enabled = true
+		if oldEnabled, ok := enabled[table.Schema+"\x00"+table.Name]; ok {
+			table.Enabled = oldEnabled
+		}
 		tables = append(tables, table)
 	}
 	if err := rows.Err(); err != nil {
@@ -114,20 +147,35 @@ func initCommand(args []string) error {
 	if len(tables) == 0 {
 		return fmt.Errorf("no user tables found")
 	}
-	cfg := config{Version: "1", DatabaseURLEnv: "CDC_DATABASE_URL", Publication: "app_cdc_pub", Slot: "app_cdc_slot", Tables: tables}
+	cfg := config{Version: "1", DatabaseURL: *dsn, Publication: "app_cdc_pub", Slot: "app_cdc_slot", Tables: tables}
+	if previous != nil {
+		if previous.Publication != "" {
+			cfg.Publication = previous.Publication
+		}
+		if previous.Slot != "" {
+			cfg.Slot = previous.Slot
+		}
+	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(*configPath); err == nil {
+	if _, err := os.Stat(*configPath); err == nil && !*refresh {
 		return fmt.Errorf("%s already exists; remove it or choose another --config path", *configPath)
-	} else if !os.IsNotExist(err) {
+	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if err := os.WriteFile(*configPath, data, 0o644); err != nil {
+	if err := os.WriteFile(*configPath, data, 0o600); err != nil {
 		return err
 	}
-	fmt.Printf("Wrote %s with %d tables. Set enabled: false for tables to ignore.\n", *configPath, len(tables))
+	if err := os.Chmod(*configPath, 0o600); err != nil {
+		return err
+	}
+	verb := "Wrote"
+	if previous != nil {
+		verb = "Updated"
+	}
+	fmt.Printf("%s %s with %d tables. Set enabled: false for tables to ignore.\n", verb, *configPath, len(tables))
 	return nil
 }
 
@@ -152,13 +200,16 @@ func generateCommand(args []string) error {
 	if cfg.Publication == "" || cfg.Slot == "" {
 		return fmt.Errorf("publication and slot must be set in %s", *configPath)
 	}
-	envName := cfg.DatabaseURLEnv
-	if envName == "" {
-		envName = "CDC_DATABASE_URL"
-	}
-	dsn := os.Getenv(envName)
+	dsn := cfg.DatabaseURL
 	if dsn == "" {
-		return fmt.Errorf("environment variable %s is required", envName)
+		envName := cfg.DatabaseURLEnv
+		if envName == "" {
+			envName = "CDC_DATABASE_URL"
+		}
+		dsn = os.Getenv(envName)
+	}
+	if dsn == "" {
+		return fmt.Errorf("database_url is missing from %s; rerun init with --dsn", *configPath)
 	}
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, dsn)
